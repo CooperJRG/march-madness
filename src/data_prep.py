@@ -199,7 +199,8 @@ def map_team_names(stats_df, teams_csv_path, format="Men"):
     return merged
 
 if __name__ == "__main__":
-    base_dir = "/Users/coopergilkey/Coding/March Madness/march-machine-learning-mania-2026"
+    # Project root; data lives in march-machine-learning-mania-2026/
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'march-machine-learning-mania-2026'))
     
     configurations = [
         {

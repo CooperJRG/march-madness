@@ -7,10 +7,35 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
 
-def prep_tournament_data(base_dir):
+# Features to exclude: ablation showed removing these improves 10-year avg Brier score
+# Can be overridden by iterative removal result file (feature_exclusion_best.txt in project root)
+FEATURES_TO_EXCLUDE = {
+    'Diff_DR_mean', 'Diff_FGM3_mean', 'Diff_OppBlk_mean', 'Diff_OppPF_mean',
+    'Diff_OppStl_mean', 'Diff_PointsPG', 'Diff_Recent_FTA_mean', 'Diff_WinPct',
+    'Diff_FGA3_mean', 'Diff_OppAst_mean',
+}
+
+
+def _get_exclusion_set():
+    """Use exclusion list from iterative removal if present, else default FEATURES_TO_EXCLUDE."""
+    try:
+        base = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+        path = os.path.join(base, 'feature_exclusion_best.txt')
+        if os.path.isfile(path):
+            with open(path, 'r') as f:
+                return {line.strip() for line in f if line.strip()}
+    except Exception:
+        pass
+    return FEATURES_TO_EXCLUDE
+
+
+def prep_tournament_data(base_dir, features_exclude=None):
     """
     Creates historical pairwise matchups for the NCAA Tournament data.
+    features_exclude: optional set of feature names to exclude; if None, uses FEATURES_TO_EXCLUDE
+    (or best list from iterative removal if present).
     """
+    exclude = _get_exclusion_set() if features_exclude is None else features_exclude
     print("Loading tournament results...")
     m_tourney_results = pd.read_csv(os.path.join(base_dir, 'march-machine-learning-mania-2026', 'MNCAATourneyCompactResults.csv'))
     w_tourney_results = pd.read_csv(os.path.join(base_dir, 'march-machine-learning-mania-2026', 'WNCAATourneyCompactResults.csv'))
@@ -91,6 +116,8 @@ def prep_tournament_data(base_dir):
     
     # In addition to differences, keep the absolute Cooper Ratings
     features = diff_features + ['IsMen', 'A_PredictedCooperRating', 'B_PredictedCooperRating', 'A_SeedNum', 'B_SeedNum']
+    # Exclude features that ablation showed hurt Brier score (removing them improved it)
+    features = [f for f in features if f not in exclude]
     
     # Drop rows with NA (e.g. if we lack stats for a team in an early year)
     matchups.dropna(subset=features, inplace=True)
@@ -133,6 +160,59 @@ def post_process_predictions(preds, df_val):
         new_preds[i] = p
         
     return new_preds
+
+
+def evaluate_brier_cv(df, features, verbose=False):
+    """
+    Runs 10-year rolling cross-validation only; returns average Brier score.
+    Does not train final models. Use for feature ablation.
+    """
+    available_seasons = sorted(df['Season'].unique())
+    test_seasons = [s for s in available_seasons if 2013 <= s <= 2023 and s != 2020]
+    ensemble_briers = []
+
+    for test_season in test_seasons:
+        train_df = df[df['Season'] < test_season]
+        val_df = df[df['Season'] == test_season]
+        if len(train_df) == 0 or len(val_df) == 0:
+            continue
+        X_train = train_df[features]
+        y_train = train_df['Target']
+        X_val = val_df[features]
+        y_val = val_df['Target']
+
+        xgb_model = xgb.XGBClassifier(
+            n_estimators=1000, learning_rate=0.02, max_depth=2, min_child_weight=1,
+            subsample=0.6, colsample_bytree=0.6, gamma=0.3, reg_alpha=0.1, reg_lambda=1,
+            eval_metric='logloss', early_stopping_rounds=50, random_state=42
+        )
+        xgb_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+        xgb_val_preds = xgb_model.predict_proba(X_val)[:, 1]
+
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_val_scaled = scaler.transform(X_val)
+        lr_model = LogisticRegression(C=1.0, max_iter=1000, random_state=42, solver='lbfgs')
+        lr_model.fit(X_train_scaled, y_train)
+        lr_val_preds = lr_model.predict_proba(X_val_scaled)[:, 1]
+
+        mlp_model = MLPClassifier(
+            hidden_layer_sizes=(128, 64), activation='relu', alpha=0.001,
+            learning_rate_init=0.001, max_iter=500, early_stopping=True,
+            validation_fraction=0.1, random_state=42
+        )
+        mlp_model.fit(X_train_scaled, y_train)
+        mlp_val_preds = mlp_model.predict_proba(X_val_scaled)[:, 1]
+
+        val_preds = (xgb_val_preds + lr_val_preds + mlp_val_preds) / 3.0
+        val_preds_processed = post_process_predictions(val_preds, val_df)
+        val_bs = brier_score_loss(y_val, val_preds_processed)
+        ensemble_briers.append(val_bs)
+        if verbose:
+            print(f"  Season {test_season} Brier: {val_bs:.4f}")
+
+    return np.mean(ensemble_briers) if ensemble_briers else np.nan
+
 
 def train_tournament_model(df, features):
     """
@@ -260,9 +340,18 @@ def train_tournament_model(df, features):
     
     return final_model, final_lr, final_mlp, scaler, features, df.iloc[0:1] # Just returns a dummy row to get column types
 
+def load_team_names(base_dir):
+    """Load TeamID -> TeamName from MTeams and WTeams for readable bracket output."""
+    data_dir = os.path.join(base_dir, 'march-machine-learning-mania-2026')
+    m_teams = pd.read_csv(os.path.join(data_dir, 'MTeams.csv'))[['TeamID', 'TeamName']]
+    w_teams = pd.read_csv(os.path.join(data_dir, 'WTeams.csv'))[['TeamID', 'TeamName']]
+    teams = pd.concat([m_teams, w_teams], ignore_index=True)
+    return teams.set_index('TeamID')['TeamName'].to_dict()
+
+
 def create_2026_submission(xgb_model, lr_model, mlp_model, scaler, base_dir, features):
     """
-    Produces the submission file for 2026 Phase 2.
+    Produces the submission file for 2026 Phase 2 and a readable bracket CSV with team names.
     """
     print("\nGenerating 2026 predictions...")
     
@@ -276,6 +365,9 @@ def create_2026_submission(xgb_model, lr_model, mlp_model, scaler, base_dir, fea
     
     # We only care about 2026
     sub = sub[sub['Season'] == 2026].copy()
+    
+    # Load team names for readable bracket
+    team_id_to_name = load_team_names(base_dir)
     
     # Load 2026 stats and predict Cooper ratings
     m_stats_df = pd.read_csv(os.path.join(base_dir, 'march-machine-learning-mania-2026', 'MRegularSeasonAggregatedStats.csv'))
@@ -330,13 +422,30 @@ def create_2026_submission(xgb_model, lr_model, mlp_model, scaler, base_dir, fea
     
     sub['Pred'] = preds
     
-    # Save final submission
+    # Save final submission (ID, Pred for Kaggle)
     out_path = os.path.join(base_dir, 'FINAL_MarchMadness_2026_Submission.csv')
     sub[['ID', 'Pred']].to_csv(out_path, index=False)
-    print(f"DONE. 2026 Predictions saved to {out_path}")
+    print(f"2026 Predictions saved to {out_path}")
+    
+    # Build readable bracket CSV with team names
+    bracket = sub.copy()
+    bracket['TeamA_Name'] = bracket['TeamA'].map(team_id_to_name)
+    bracket['TeamB_Name'] = bracket['TeamB'].map(team_id_to_name)
+    bracket['Predicted_Winner'] = np.where(
+        bracket['Pred'] >= 0.5,
+        bracket['TeamA_Name'],
+        bracket['TeamB_Name']
+    )
+    bracket_out = bracket[['ID', 'TeamA_Name', 'TeamB_Name', 'Pred', 'Predicted_Winner']]
+    bracket_out.columns = ['ID', 'TeamA', 'TeamB', 'Win_Probability_TeamA', 'Predicted_Winner']
+    bracket_path = os.path.join(base_dir, 'Bracket_Readable_2026.csv')
+    bracket_out.to_csv(bracket_path, index=False)
+    print(f"Readable bracket (team names) saved to {bracket_path}")
+    print("DONE.")
 
 if __name__ == "__main__":
-    base_dir = "/Users/coopergilkey/Coding/March Madness"
+    # Default to project root (parent of src/)
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     
     df, features = prep_tournament_data(base_dir)
     print("Features used:", features)

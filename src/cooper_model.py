@@ -164,7 +164,7 @@ def generate_historical_ratings(model, all_stats, features, out_path):
     print(out_df[out_df['Season'] == 2021].sort_values(by='PredictedCooperRating', ascending=False).head(10))
 
 if __name__ == "__main__":
-    base_dir = "/Users/coopergilkey/Coding/March Madness"
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     
     # 1. Load data
     df_merged, m_stats_df, w_stats_df = load_and_merge_data(base_dir)
